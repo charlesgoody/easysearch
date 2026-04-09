@@ -2,7 +2,7 @@ name: Build easysearch
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -30,6 +30,7 @@ jobs:
           msbuild .\easysearch.sln `
             /p:Configuration=Release `
             /p:Platform=x64 `
+            /p:VcpkgEnableManifest=true `
             /m
 
       - name: Prepare package
@@ -42,7 +43,6 @@ jobs:
           if (Test-Path ".\\x64\\Release\\*.dll") {
             Copy-Item ".\\x64\\Release\\*.dll" ".\\package\\" -Force
           }
-
 
       - name: Zip package
         shell: pwsh
