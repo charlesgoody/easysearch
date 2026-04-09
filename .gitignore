@@ -1,0 +1,56 @@
+# Visual Studio
+.vs/
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]64/
+out/
+
+# MSVC intermediate files
+*.obj
+*.ipch
+*.iobj
+*.ipdb
+*.ilk
+*.pch
+*.pdb
+*.idb
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
+*.tmp
+*.cache
+*.aps
+
+# CMake / generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# vcpkg manifest mode output
+vcpkg_installed/
+installed/
+buildtrees/
+packages/
+downloads/
+
+# Windows / editor
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+
+# Exported app data
+places.csv
+places.xlsx

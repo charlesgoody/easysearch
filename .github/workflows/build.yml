@@ -1,0 +1,56 @@
+name: Build easysearch
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg $env:USERPROFILE\vcpkg
+          & $env:USERPROFILE\vcpkg\bootstrap-vcpkg.bat
+          & $env:USERPROFILE\vcpkg\vcpkg.exe integrate install
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          msbuild .\easysearch.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /m
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+
+          Copy-Item ".\\x64\\Release\\easysearch.exe" ".\\package\\" -Force
+
+          if (Test-Path ".\\x64\\Release\\*.dll") {
+            Copy-Item ".\\x64\\Release\\*.dll" ".\\package\\" -Force
+          }
+
+
+      - name: Zip package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path .\\package\\* -DestinationPath .\\easysearch-win-x64.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: easysearch-win-x64
+          path: easysearch-win-x64.zip
