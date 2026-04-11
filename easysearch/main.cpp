@@ -64,9 +64,7 @@ struct LayoutState {
     int bottomMargin = 0;
     int toolbarHeight = 0;
     int debugWidth = 0;
-    int mapListGapY = 0;
-    double mapRatio = 0.46;
-    SIZE minTrack = { 1000, 680 };
+    SIZE minTrack = { 800, 450 };
 };
 
 static LayoutState g_layout;
@@ -74,8 +72,14 @@ static double g_bboxSouth = 0.0, g_bboxWest = 0.0, g_bboxNorth = 0.0, g_bboxEast
 static bool g_hasMapArea = false;
 static bool g_mapReady = false;
 static bool g_updatingCombo = false;
+static int g_lastPresetIndex = 0;
+static DWORD g_uiThreadId = 0;
+static HFONT g_hDlgFont = nullptr;
 static ComPtr<ICoreWebView2Controller> g_webController;
 static ComPtr<ICoreWebView2> g_webView;
+
+static constexpr UINT WM_SEARCH_DONE = WM_APP + 1;
+static constexpr UINT WM_LOG_MSG     = WM_APP + 2;
 
 static std::string Trim(std::string s) {
     auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
@@ -115,6 +119,11 @@ static bool ContainsNoCase(const std::wstring& haystack, const std::wstring& nee
 }
 
 static void LogMsg(const std::wstring& msg) {
+    if (!g_hDlg) return;
+    if (g_uiThreadId && GetCurrentThreadId() != g_uiThreadId) {
+        PostMessageW(g_hDlg, WM_LOG_MSG, 0, (LPARAM) new std::wstring(msg));
+        return;
+    }
     if (!g_hDebug) return;
     int len = GetWindowTextLengthW(g_hDebug);
     SendMessageW(g_hDebug, EM_SETSEL, len, len);
@@ -158,30 +167,21 @@ static RECT GetChildRectInClient(HWND parent, int id) {
 static void CaptureLayout(HWND hwnd) {
     RECT client{};
     GetClientRect(hwnd, &client);
-    RECT rcMap = GetChildRectInClient(hwnd, IDC_MAPHOST);
-    RECT rcList = GetChildRectInClient(hwnd, IDC_LIST);
+    RECT rcMap   = GetChildRectInClient(hwnd, IDC_MAPHOST);
     RECT rcDebug = GetChildRectInClient(hwnd, IDC_DEBUG);
     RECT rcBtnSearch = GetChildRectInClient(hwnd, IDC_BTN_SEARCH);
 
-    g_layout.baseClientW = client.right - client.left;
-    g_layout.baseClientH = client.bottom - client.top;
-    g_layout.topMargin = rcBtnSearch.top;
-    g_layout.leftMargin = rcMap.left;
-    g_layout.rightMargin = client.right - rcDebug.right;
-    g_layout.gapX = rcDebug.left - rcMap.right;
-    g_layout.contentTop = rcMap.top;
+    g_layout.baseClientW  = client.right - client.left;
+    g_layout.baseClientH  = client.bottom - client.top;
+    g_layout.topMargin    = rcBtnSearch.top;
+    g_layout.leftMargin   = rcMap.left;
+    g_layout.rightMargin  = client.right - rcDebug.right;
+    g_layout.gapX         = rcDebug.left - rcMap.right;
+    g_layout.contentTop   = rcMap.top;
     g_layout.bottomMargin = client.bottom - rcDebug.bottom;
     g_layout.toolbarHeight = rcMap.top - g_layout.topMargin;
-    g_layout.debugWidth = rcDebug.right - rcDebug.left;
-    g_layout.mapListGapY = rcList.top - rcMap.bottom;
-    int contentH = rcDebug.bottom - rcMap.top;
-    int mapH = rcMap.bottom - rcMap.top;
-    if (contentH > 0) g_layout.mapRatio = (double)mapH / (double)contentH;
+    g_layout.debugWidth   = rcDebug.right - rcDebug.left;
 
-    RECT wnd{};
-    GetWindowRect(hwnd, &wnd);
-    g_layout.minTrack.cx = (wnd.right - wnd.left);
-    g_layout.minTrack.cy = (wnd.bottom - wnd.top);
     g_layout.ready = true;
 }
 
@@ -208,16 +208,8 @@ static void LayoutControls(HWND hwnd) {
     int contentH = cy - contentTop - g_layout.bottomMargin;
     if (contentH < 260) contentH = 260;
 
-    int mapH = (int)(contentH * g_layout.mapRatio);
-    if (mapH < 180) mapH = 180;
-    if (mapH > contentH - 120) mapH = contentH - 120;
-    int listY = contentTop + mapH + g_layout.mapListGapY;
-    int listH = cy - listY - g_layout.bottomMargin;
-    if (listH < 100) listH = 100;
-
-    MoveWindow(GetDlgItem(hwnd, IDC_MAPHOST), g_layout.leftMargin, contentTop, leftW, mapH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_LIST), g_layout.leftMargin, listY, leftW, listH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_DEBUG), debugX, contentTop, debugW, cy - contentTop - g_layout.bottomMargin, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_MAPHOST), g_layout.leftMargin, contentTop, leftW, contentH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_DEBUG),   debugX, contentTop, debugW, contentH, TRUE);
 
     ResizeWebView();
 }
@@ -262,7 +254,7 @@ static std::string BuildDetailedAddress(const json& tags) {
     return address;
 }
 
-static bool ParsePlacesFromJson(const std::string& resp, const std::wstring& categoryLabel) {
+static bool ParsePlacesFromJson(const std::string& resp, const std::wstring& categoryLabel, std::vector<PlaceItem>& out) {
     try {
         json j = json::parse(resp);
         if (!j.contains("elements") || !j["elements"].is_array()) {
@@ -270,7 +262,7 @@ static bool ParsePlacesFromJson(const std::string& resp, const std::wstring& cat
             return false;
         }
 
-        g_items.clear();
+        out.clear();
         for (auto& e : j["elements"]) {
             if (!e.contains("tags")) continue;
             const auto& t = e["tags"];
@@ -294,7 +286,7 @@ static bool ParsePlacesFromJson(const std::string& resp, const std::wstring& cat
                 p.lat = e["center"].value("lat", 0.0);
                 p.lon = e["center"].value("lon", 0.0);
             }
-            g_items.push_back(std::move(p));
+            out.push_back(std::move(p));
         }
         return true;
     }
@@ -358,7 +350,7 @@ static bool PerformOverpassPost(const std::string& endpoint, const std::string& 
     return rc == CURLE_OK;
 }
 
-static bool RunOverpassQuery(const std::string& query, const std::wstring& categoryLabel) {
+static bool RunOverpassQuery(const std::string& query, const std::wstring& categoryLabel, std::vector<PlaceItem>& out) {
     for (int endpointIndex = 0; endpointIndex < kOverpassEndpointCount; ++endpointIndex) {
         const std::string endpoint = kOverpassEndpoints[endpointIndex];
         for (int attempt = 0; attempt < 3; ++attempt) {
@@ -382,7 +374,7 @@ static bool RunOverpassQuery(const std::string& query, const std::wstring& categ
                 LogMsg(L"response preview:");
                 LogMsg(U2W(preview));
 
-                if (httpCode == 200 && ParsePlacesFromJson(resp, categoryLabel)) {
+                if (httpCode == 200 && ParsePlacesFromJson(resp, categoryLabel, out)) {
                     return true;
                 }
             }
@@ -411,7 +403,7 @@ static std::vector<int> BuildRadiusPlan(double radius) {
     return plan;
 }
 
-static bool SearchByRadius(double lat, double lon, double radius, int presetIndex) {
+static bool SearchByRadius(double lat, double lon, double radius, int presetIndex, std::vector<PlaceItem>& out) {
     const auto& preset = kPlaceTypes[presetIndex];
     auto plan = BuildRadiusPlan(radius);
     for (int r : plan) {
@@ -422,12 +414,12 @@ static bool SearchByRadius(double lat, double lon, double radius, int presetInde
         q << "way(around:" << r << "," << lat << "," << lon << ")[\"" << preset.key << "\"=\"" << preset.value << "\"];";
         q << "relation(around:" << r << "," << lat << "," << lon << ")[\"" << preset.key << "\"=\"" << preset.value << "\"];";
         q << ");out center tags;";
-        if (RunOverpassQuery(q.str(), preset.label)) return true;
+        if (RunOverpassQuery(q.str(), preset.label, out)) return true;
     }
     return false;
 }
 
-static bool SearchByBBox(double south, double west, double north, double east, int presetIndex) {
+static bool SearchByBBox(double south, double west, double north, double east, int presetIndex, std::vector<PlaceItem>& out) {
     const auto& preset = kPlaceTypes[presetIndex];
     std::ostringstream q;
     q << "[out:json][timeout:20];(";
@@ -435,7 +427,45 @@ static bool SearchByBBox(double south, double west, double north, double east, i
     q << "way[\"" << preset.key << "\"=\"" << preset.value << "\"](" << south << "," << west << "," << north << "," << east << ");";
     q << "relation[\"" << preset.key << "\"=\"" << preset.value << "\"](" << south << "," << west << "," << north << "," << east << ");";
     q << ");out center tags;";
-    return RunOverpassQuery(q.str(), preset.label);
+    return RunOverpassQuery(q.str(), preset.label, out);
+}
+
+struct SearchContext {
+    HWND hwnd;
+    bool byBBox;
+    double lat, lon, radius;
+    double south, west, north, east;
+    int presetIndex;
+    SYSTEMTIME startTime;
+    bool succeeded;
+    std::vector<PlaceItem> result;
+};
+
+static DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
+    auto* ctx = static_cast<SearchContext*>(lpParam);
+    if (ctx->byBBox)
+        ctx->succeeded = SearchByBBox(ctx->south, ctx->west, ctx->north, ctx->east, ctx->presetIndex, ctx->result);
+    else
+        ctx->succeeded = SearchByRadius(ctx->lat, ctx->lon, ctx->radius, ctx->presetIndex, ctx->result);
+    PostMessageW(ctx->hwnd, WM_SEARCH_DONE, 0, (LPARAM)ctx);
+    return 0;
+}
+
+static std::wstring MakeExportFilename(int presetIndex, const SYSTEMTIME& st, const wchar_t* ext) {
+    int hour12 = st.wHour % 12;
+    if (hour12 == 0) hour12 = 12;
+    const wchar_t* ampm = (st.wHour < 12) ? L"am" : L"pm";
+    std::wstring label = (presetIndex >= 0 && presetIndex < kPlaceTypeCount)
+        ? std::wstring(kPlaceTypes[presetIndex].label) : L"unknown";
+    std::transform(label.begin(), label.end(), label.begin(),
+        [](wchar_t ch) { return (wchar_t)towlower(ch); });
+    std::replace(label.begin(), label.end(), L' ', L'_');
+    wchar_t buf[260]{};
+    swprintf_s(buf, L"%02d_%02d_%04d_%02d_%02d%s_%s%s",
+        st.wMonth, st.wDay, st.wYear,
+        hour12, st.wMinute, ampm,
+        label.c_str(), ext);
+    return buf;
 }
 
 static void InitListColumns(HWND hList) {
@@ -455,10 +485,10 @@ static void InitListColumns(HWND hList) {
     c.cx = 85;  c.pszText = (LPWSTR)L"Lon"; ListView_InsertColumn(hList, 10, &c);
 }
 
-static void UpdateListView(HWND hList) {
+static void UpdateListView(HWND hList, const std::vector<PlaceItem>& items) {
     ListView_DeleteAllItems(hList);
-    for (size_t i = 0; i < g_items.size(); ++i) {
-        const auto& p = g_items[i];
+    for (size_t i = 0; i < items.size(); ++i) {
+        const auto& p = items[i];
         LVITEMW it{};
         it.mask = LVIF_TEXT;
         it.iItem = (int)i;
@@ -497,7 +527,7 @@ static std::string CsvEscape(const std::string& s) {
     return '"' + out + '"';
 }
 
-static bool ExportCSVUtf8Bom(const std::wstring& path) {
+static bool ExportCSVUtf8Bom(const std::wstring& path, const std::vector<PlaceItem>& items) {
     FILE* fp = nullptr;
     errno_t err = _wfopen_s(&fp, path.c_str(), L"wb");
     if (err != 0 || !fp) return false;
@@ -505,7 +535,7 @@ static bool ExportCSVUtf8Bom(const std::wstring& path) {
     fwrite(bom, 1, 3, fp);
     std::string header = "Name,Category,Brand,Cuisine,Address,Phone,Website,OpeningHours,Email,Lat,Lon\r\n";
     fwrite(header.data(), 1, header.size(), fp);
-    for (const auto& p : g_items) {
+    for (const auto& p : items) {
         std::ostringstream row;
         row << CsvEscape(p.name) << ','
             << CsvEscape(p.category) << ','
@@ -524,7 +554,7 @@ static bool ExportCSVUtf8Bom(const std::wstring& path) {
     return true;
 }
 
-static bool ExportXLSX(const std::wstring& path) {
+static bool ExportXLSX(const std::wstring& path, const std::vector<PlaceItem>& items) {
     std::string utf8Path = W2U(path);
     lxw_workbook* workbook = workbook_new(utf8Path.c_str());
     if (!workbook) return false;
@@ -545,8 +575,8 @@ static bool ExportXLSX(const std::wstring& path) {
     worksheet_set_column(ws, 4, 4, 42, nullptr);
     worksheet_set_column(ws, 5, 8, 22, nullptr);
     worksheet_set_column(ws, 9, 10, 14, nullptr);
-    for (lxw_row_t i = 0; i < (lxw_row_t)g_items.size(); ++i) {
-        const auto& p = g_items[i];
+    for (lxw_row_t i = 0; i < (lxw_row_t)items.size(); ++i) {
+        const auto& p = items[i];
         worksheet_write_string(ws, i + 1, 0, p.name.c_str(), nullptr);
         worksheet_write_string(ws, i + 1, 1, p.category.c_str(), nullptr);
         worksheet_write_string(ws, i + 1, 2, p.brand.c_str(), nullptr);
@@ -778,10 +808,112 @@ static void InitWebView(HWND hwnd) {
     }
 }
 
-static void FinalizeSearch(HWND hwnd, const wchar_t* successPrefix) {
-    UpdateListView(GetDlgItem(hwnd, IDC_LIST));
-    if (g_items.empty()) LogMsg(L"not found");
-    else LogMsg(std::wstring(successPrefix) + std::to_wstring(g_items.size()));
+static constexpr int IDC_RES_CSV  = 1;
+static constexpr int IDC_RES_XLS  = 2;
+static constexpr int IDC_RES_LIST = 3;
+static constexpr int RES_TOOLBAR_H = 34;
+
+struct ResultWindow {
+    std::vector<PlaceItem> items;
+    int presetIndex = 0;
+    SYSTEMTIME searchTime{};
+    HWND hList = nullptr;
+};
+
+static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        auto* rw = static_cast<ResultWindow*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)rw);
+        HINSTANCE hInst = cs->hInstance;
+        HWND hCsvBtn = CreateWindowExW(0, L"BUTTON", L"Export CSV",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            4, 4, 110, 26, hwnd, (HMENU)(UINT_PTR)IDC_RES_CSV, hInst, nullptr);
+        HWND hXlsBtn = CreateWindowExW(0, L"BUTTON", L"Export Excel",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            120, 4, 110, 26, hwnd, (HMENU)(UINT_PTR)IDC_RES_XLS, hInst, nullptr);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+            0, RES_TOOLBAR_H, rc.right, rc.bottom - RES_TOOLBAR_H,
+            hwnd, (HMENU)(UINT_PTR)IDC_RES_LIST, hInst, nullptr);
+        if (g_hDlgFont) {
+            SendMessageW(hCsvBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hXlsBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hList,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+        }
+        InitListColumns(hList);
+        UpdateListView(hList, rw->items);
+        rw->hList = hList;
+        return 0;
+    }
+    case WM_SIZE: {
+        auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (rw && rw->hList) {
+            int cx = LOWORD(lParam), cy = HIWORD(lParam);
+            MoveWindow(rw->hList, 0, RES_TOOLBAR_H, cx, cy - RES_TOOLBAR_H, TRUE);
+        }
+        return 0;
+    }
+    case WM_COMMAND: {
+        auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (!rw) break;
+        if (LOWORD(wParam) == IDC_RES_CSV) {
+            std::wstring name = MakeExportFilename(rw->presetIndex, rw->searchTime, L".csv");
+            if (ExportCSVUtf8Bom(name, rw->items))
+                MessageBoxW(hwnd, (L"Exported: " + name).c_str(), L"Export CSV", MB_OK);
+            else
+                MessageBoxW(hwnd, L"Export failed", L"Export CSV", MB_OK | MB_ICONERROR);
+        } else if (LOWORD(wParam) == IDC_RES_XLS) {
+            std::wstring name = MakeExportFilename(rw->presetIndex, rw->searchTime, L".xlsx");
+            if (ExportXLSX(name, rw->items))
+                MessageBoxW(hwnd, (L"Exported: " + name).c_str(), L"Export Excel", MB_OK);
+            else
+                MessageBoxW(hwnd, L"Export failed", L"Export Excel", MB_OK | MB_ICONERROR);
+        }
+        return 0;
+    }
+    case WM_DESTROY: {
+        auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        delete rw;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void CreateResultWindow(HWND hOwner, SearchContext* ctx) {
+    const SYSTEMTIME& st = ctx->startTime;
+    int hour12 = st.wHour % 12;
+    if (hour12 == 0) hour12 = 12;
+    const wchar_t* ampm = (st.wHour < 12) ? L"am" : L"pm";
+
+    std::wstring title = kPlaceTypes[ctx->presetIndex].label;
+    title += ctx->byBBox ? L" \u2014 Search Area" : L" \u2014 Search Center";
+    wchar_t dateBuf[64]{};
+    swprintf_s(dateBuf, L"  %02d/%02d/%04d %02d:%02d%s",
+        st.wMonth, st.wDay, st.wYear, hour12, st.wMinute, ampm);
+    title += dateBuf;
+    title += L"  (" + std::to_wstring(ctx->result.size()) + L" results)";
+
+    auto* rw = new ResultWindow{};
+    rw->items = std::move(ctx->result);
+    rw->presetIndex = ctx->presetIndex;
+    rw->searchTime = ctx->startTime;
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_APPWINDOW,
+        L"EasySearchResult",
+        title.c_str(),
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1100, 480,
+        nullptr, nullptr, GetModuleHandleW(nullptr), rw
+    );
+    if (hwnd) ShowWindow(hwnd, SW_SHOW);
+    else delete rw;
 }
 
 INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -814,12 +946,15 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         g_hDlg = hwnd;
+        g_uiThreadId = GetCurrentThreadId();
+        g_hDlgFont = (HFONT)SendMessageW(GetDlgItem(hwnd, IDC_BTN_SEARCH), WM_GETFONT, 0, 0);
         g_hDebug = GetDlgItem(hwnd, IDC_DEBUG);
         SetDlgItemTextW(hwnd, IDC_LAT, L"25.033000");
         SetDlgItemTextW(hwnd, IDC_LON, L"121.565400");
         SetDlgItemTextW(hwnd, IDC_RADIUS, L"1500");
         InitTypeCombo(hwnd);
-        InitListColumns(GetDlgItem(hwnd, IDC_LIST));
+        EnableWindow(GetDlgItem(hwnd, IDC_BTN_CSV), FALSE);
+        EnableWindow(GetDlgItem(hwnd, IDC_BTN_XLS), FALSE);
         InitWebView(hwnd);
         CaptureLayout(hwnd);
         LogMsg(L"Ready.");
@@ -854,8 +989,17 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             double lon = _wtof(GetDlgItemTextString(hwnd, IDC_LON).c_str());
             double radius = _wtof(GetDlgItemTextString(hwnd, IDC_RADIUS).c_str());
             LogMsg(L"Searching by center: " + std::wstring(kPlaceTypes[presetIndex].label));
-            if (SearchByRadius(lat, lon, radius, presetIndex)) FinalizeSearch(hwnd, L"center search count = ");
-            else LogMsg(L"search failed");
+            {
+                auto* ctx = new SearchContext{};
+                ctx->hwnd = hwnd;
+                ctx->byBBox = false;
+                ctx->lat = lat; ctx->lon = lon; ctx->radius = radius;
+                ctx->presetIndex = presetIndex;
+                GetLocalTime(&ctx->startTime);
+                HANDLE hThread = CreateThread(nullptr, 0, SearchThreadProc, ctx, 0, nullptr);
+                if (hThread) CloseHandle(hThread);
+                else { delete ctx; LogMsg(L"failed to start search thread"); }
+            }
             return TRUE;
         }
         case IDC_BTN_AREA: {
@@ -869,20 +1013,58 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return TRUE;
             }
             LogMsg(L"Searching visible area: " + std::wstring(kPlaceTypes[presetIndex].label));
-            if (SearchByBBox(g_bboxSouth, g_bboxWest, g_bboxNorth, g_bboxEast, presetIndex)) FinalizeSearch(hwnd, L"area search count = ");
-            else LogMsg(L"search failed");
+            {
+                auto* ctx = new SearchContext{};
+                ctx->hwnd = hwnd;
+                ctx->byBBox = true;
+                ctx->south = g_bboxSouth; ctx->west = g_bboxWest;
+                ctx->north = g_bboxNorth; ctx->east = g_bboxEast;
+                ctx->presetIndex = presetIndex;
+                GetLocalTime(&ctx->startTime);
+                HANDLE hThread = CreateThread(nullptr, 0, SearchThreadProc, ctx, 0, nullptr);
+                if (hThread) CloseHandle(hThread);
+                else { delete ctx; LogMsg(L"failed to start search thread"); }
+            }
             return TRUE;
         }
-        case IDC_BTN_CSV:
-            if (ExportCSVUtf8Bom(L"places.csv")) LogMsg(L"CSV exported: places.csv");
+        case IDC_BTN_CSV: {
+            SYSTEMTIME st{}; GetLocalTime(&st);
+            std::wstring csvName = MakeExportFilename(g_lastPresetIndex, st, L".csv");
+            if (ExportCSVUtf8Bom(csvName, g_items)) LogMsg(L"CSV exported: " + csvName);
             else LogMsg(L"CSV export failed");
             return TRUE;
-        case IDC_BTN_XLS:
-            if (ExportXLSX(L"places.xlsx")) LogMsg(L"Excel exported: places.xlsx");
+        }
+        case IDC_BTN_XLS: {
+            SYSTEMTIME st{}; GetLocalTime(&st);
+            std::wstring xlsName = MakeExportFilename(g_lastPresetIndex, st, L".xlsx");
+            if (ExportXLSX(xlsName, g_items)) LogMsg(L"Excel exported: " + xlsName);
             else LogMsg(L"Excel export failed");
             return TRUE;
         }
+        }
         break;
+    }
+    case WM_SEARCH_DONE: {
+        auto* ctx = reinterpret_cast<SearchContext*>(lParam);
+        if (ctx->succeeded) {
+            LogMsg(std::wstring(ctx->byBBox ? L"area" : L"center") +
+                   L" search count = " + std::to_wstring(ctx->result.size()));
+            CreateResultWindow(hwnd, ctx);
+        } else {
+            LogMsg(L"search failed");
+        }
+        delete ctx;
+        return TRUE;
+    }
+    case WM_LOG_MSG: {
+        auto* msg = reinterpret_cast<std::wstring*>(lParam);
+        if (g_hDebug && msg) {
+            int len = GetWindowTextLengthW(g_hDebug);
+            SendMessageW(g_hDebug, EM_SETSEL, len, len);
+            SendMessageW(g_hDebug, EM_REPLACESEL, FALSE, (LPARAM)(*msg + L"\r\n").c_str());
+        }
+        delete msg;
+        return TRUE;
     }
     case WM_CLOSE:
         EndDialog(hwnd, 0);
@@ -899,6 +1081,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = ResultWindowProc;
+    wc.hInstance     = hInstance;
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hIcon         = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+    wc.hIconSm       = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON),
+                           IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                           GetSystemMetrics(SM_CYSMICON), 0);
+    wc.lpszClassName = L"EasySearchResult";
+    RegisterClassExW(&wc);
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
     INT_PTR ret = DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_MAINDIALOG), nullptr, DlgProc, 0);
