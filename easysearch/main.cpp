@@ -74,6 +74,7 @@ static bool g_mapReady = false;
 static bool g_updatingCombo = false;
 static int g_lastPresetIndex = 0;
 static DWORD g_uiThreadId = 0;
+static bool g_areaMode = true;  // true = area-name mode (primary), false = lat/lon mode
 static HFONT g_hDlgFont = nullptr;
 static ComPtr<ICoreWebView2Controller> g_webController;
 static ComPtr<ICoreWebView2> g_webView;
@@ -430,20 +431,48 @@ static bool SearchByBBox(double south, double west, double north, double east, i
     return RunOverpassQuery(q.str(), preset.label, out);
 }
 
+// Search by administrative area name (e.g. "台北市", "大安區", "Taipei City").
+// Tries name → name:zh → name:en in sequence to handle both Chinese and English input.
+static bool SearchByAreaName(const std::string& areaName, int presetIndex, std::vector<PlaceItem>& out) {
+    const auto& preset = kPlaceTypes[presetIndex];
+    static const char* kNameTags[] = { "name", "name:zh", "name:en" };
+
+    for (const char* tag : kNameTags) {
+        std::ostringstream q;
+        q << "[out:json][timeout:30];";
+        q << "area[\"" << tag << "\"=\"" << areaName << "\"]->.a;";
+        q << "(";
+        q << "node[\"" << preset.key << "\"=\"" << preset.value << "\"](area.a);";
+        q << "way[\"" << preset.key << "\"=\"" << preset.value << "\"](area.a);";
+        q << "relation[\"" << preset.key << "\"=\"" << preset.value << "\"](area.a);";
+        q << ");out center tags;";
+
+        LogMsg(L"Area search: [" + U2W(tag) + L"=\"" + U2W(areaName) + L"\"]");
+        bool ok = RunOverpassQuery(q.str(), preset.label, out);
+        if (ok && !out.empty()) return true;
+        if (ok && out.empty()) LogMsg(L"No results, trying next name tag...");
+    }
+    return false;
+}
+
 struct SearchContext {
     HWND hwnd;
-    bool byBBox;
-    double lat, lon, radius;
-    double south, west, north, east;
-    int presetIndex;
-    SYSTEMTIME startTime;
-    bool succeeded;
+    bool byBBox       = false;
+    bool byAreaName   = false;
+    double lat = 0, lon = 0, radius = 0;
+    double south = 0, west = 0, north = 0, east = 0;
+    std::string areaName;
+    int presetIndex = 0;
+    SYSTEMTIME startTime{};
+    bool succeeded = false;
     std::vector<PlaceItem> result;
 };
 
 static DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
     auto* ctx = static_cast<SearchContext*>(lpParam);
-    if (ctx->byBBox)
+    if (ctx->byAreaName)
+        ctx->succeeded = SearchByAreaName(ctx->areaName, ctx->presetIndex, ctx->result);
+    else if (ctx->byBBox)
         ctx->succeeded = SearchByBBox(ctx->south, ctx->west, ctx->north, ctx->east, ctx->presetIndex, ctx->result);
     else
         ctx->succeeded = SearchByRadius(ctx->lat, ctx->lon, ctx->radius, ctx->presetIndex, ctx->result);
@@ -661,6 +690,27 @@ static void InitTypeCombo(HWND hwnd) {
     PopulateTypeCombo(hwnd, L"");
     int restaurant = FindPresetIndexByLabel(L"Restaurant");
     if (restaurant >= 0) SelectPresetByActualIndex(hwnd, restaurant);
+}
+
+// IDs to show/hide when toggling search mode.
+static const int kAreaModeControls[]   = { IDC_AREA_STATIC, IDC_AREA_NAME, IDC_BTN_SEARCH_AREA_NAME };
+static const int kLatLonModeControls[] = { IDC_LAT_STATIC, IDC_LAT, IDC_LON_STATIC, IDC_LON,
+                                            IDC_RADIUS_STATIC, IDC_RADIUS, IDC_BTN_SEARCH, IDC_BTN_AREA };
+
+static void SetSearchMode(HWND hwnd, bool areaMode) {
+    g_areaMode = areaMode;
+
+    for (int id : kAreaModeControls)
+        ShowWindow(GetDlgItem(hwnd, id), areaMode ? SW_SHOW : SW_HIDE);
+    for (int id : kLatLonModeControls)
+        ShowWindow(GetDlgItem(hwnd, id), areaMode ? SW_HIDE : SW_SHOW);
+
+    // Restore IDC_BTN_AREA enabled state when returning to lat/lon mode
+    if (!areaMode)
+        EnableWindow(GetDlgItem(hwnd, IDC_BTN_AREA), (g_mapReady && g_hasMapArea) ? TRUE : FALSE);
+
+    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_TOGGLE_MODE),
+                   areaMode ? L"[ Lat/Lon ]" : L"[ Area ]");
 }
 
 static std::wstring GetMapHtml() {
@@ -957,7 +1007,8 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         EnableWindow(GetDlgItem(hwnd, IDC_BTN_XLS), FALSE);
         InitWebView(hwnd);
         CaptureLayout(hwnd);
-        LogMsg(L"Ready.");
+        SetSearchMode(hwnd, true);  // start in area-name mode (primary)
+        LogMsg(L"Ready. Enter an area name (e.g. \u53f0\u5317\u5e02, \u5927\u5b89\u5340) and press Search by Area.");
         return TRUE;
     }
     case WM_SIZE:
@@ -1041,14 +1092,37 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else LogMsg(L"Excel export failed");
             return TRUE;
         }
+        case IDC_BTN_SEARCH_AREA_NAME: {
+            int presetIndex = GetSelectedPresetIndex(hwnd);
+            if (presetIndex < 0) { LogMsg(L"Please select a place type first."); return TRUE; }
+            std::wstring wAreaName = GetDlgItemTextString(hwnd, IDC_AREA_NAME);
+            std::string areaName = W2U(wAreaName);
+            if (areaName.empty()) { LogMsg(L"Please enter an area name."); return TRUE; }
+            LogMsg(L"Searching area: \"" + wAreaName + L"\" / " + kPlaceTypes[presetIndex].label);
+            auto* ctx = new SearchContext{};
+            ctx->hwnd = hwnd;
+            ctx->byAreaName = true;
+            ctx->areaName = areaName;
+            ctx->presetIndex = presetIndex;
+            GetLocalTime(&ctx->startTime);
+            HANDLE hThread = CreateThread(nullptr, 0, SearchThreadProc, ctx, 0, nullptr);
+            if (hThread) CloseHandle(hThread);
+            else { delete ctx; LogMsg(L"failed to start search thread"); }
+            return TRUE;
+        }
+        case IDC_BTN_TOGGLE_MODE:
+            SetSearchMode(hwnd, !g_areaMode);
+            return TRUE;
         }
         break;
     }
     case WM_SEARCH_DONE: {
         auto* ctx = reinterpret_cast<SearchContext*>(lParam);
         if (ctx->succeeded) {
-            LogMsg(std::wstring(ctx->byBBox ? L"area" : L"center") +
-                   L" search count = " + std::to_wstring(ctx->result.size()));
+            std::wstring modeLabel = ctx->byAreaName
+                ? (L"area \"" + U2W(ctx->areaName) + L"\"")
+                : (ctx->byBBox ? L"bbox" : L"center");
+            LogMsg(modeLabel + L" search count = " + std::to_wstring(ctx->result.size()));
             CreateResultWindow(hwnd, ctx);
         } else {
             LogMsg(L"search failed");
