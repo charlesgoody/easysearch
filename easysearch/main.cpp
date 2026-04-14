@@ -76,6 +76,23 @@ static int g_lastPresetIndex = 0;
 static DWORD g_uiThreadId = 0;
 static bool g_areaMode = true;  // true = area-name mode (primary), false = lat/lon mode
 static HFONT g_hDlgFont = nullptr;
+
+// ── Modern UI theme colours ───────────────────────────────────────────────────
+static constexpr COLORREF kClrBg        = RGB(0xF3, 0xF3, 0xF3); // dialog background
+static constexpr COLORREF kClrInput     = RGB(0xFF, 0xFF, 0xFF); // edit / list bg
+static constexpr COLORREF kClrAccent    = RGB(0x00, 0x67, 0xC0); // primary button
+static constexpr COLORREF kClrAccentPr  = RGB(0x00, 0x50, 0x9E); // primary pressed
+static constexpr COLORREF kClrNeutral   = RGB(0xE8, 0xE8, 0xE8); // secondary button
+static constexpr COLORREF kClrNeutralPr = RGB(0xD0, 0xD0, 0xD0); // secondary pressed
+static constexpr COLORREF kClrText      = RGB(0x1A, 0x1A, 0x1A); // main text
+static constexpr COLORREF kClrLabel     = RGB(0x54, 0x54, 0x54); // label text
+static constexpr COLORREF kClrDbBg     = RGB(0x1E, 0x1E, 0x1E); // debug console bg
+static constexpr COLORREF kClrDbFg     = RGB(0xD4, 0xD4, 0xD4); // debug console text
+static constexpr COLORREF kClrSep      = RGB(0xDC, 0xDC, 0xDC); // toolbar separator
+
+static HBRUSH g_hBrushBg    = nullptr;
+static HBRUSH g_hBrushInput = nullptr;
+static HBRUSH g_hBrushDebug = nullptr;
 static ComPtr<ICoreWebView2Controller> g_webController;
 static ComPtr<ICoreWebView2> g_webView;
 
@@ -870,6 +887,49 @@ struct ResultWindow {
     HWND hList = nullptr;
 };
 
+// ── Modern button renderer (owner-draw) ──────────────────────────────────────
+// Buttons whose text contains "Search" get the accent (blue) style.
+static void DrawModernButton(const DRAWITEMSTRUCT* dis) {
+    HDC   hdc     = dis->hDC;
+    RECT  rc      = dis->rcItem;
+    bool  pressed  = (dis->itemState & ODS_SELECTED) != 0;
+    bool  disabled = (dis->itemState & ODS_DISABLED)  != 0;
+    bool  focused  = (dis->itemState & ODS_FOCUS)     != 0;
+
+    wchar_t text[128]{};
+    GetWindowTextW(dis->hwndItem, text, 128);
+    bool accent = (wcsstr(text, L"Search") != nullptr);
+
+    COLORREF bgColor, fgColor;
+    if (disabled) {
+        bgColor = RGB(0xCC, 0xCC, 0xCC);
+        fgColor = RGB(0x88, 0x88, 0x88);
+    } else if (accent) {
+        bgColor = pressed ? kClrAccentPr : kClrAccent;
+        fgColor = RGB(0xFF, 0xFF, 0xFF);
+    } else {
+        bgColor = pressed ? kClrNeutralPr : kClrNeutral;
+        fgColor = kClrText;
+    }
+
+    HBRUSH hBr = CreateSolidBrush(bgColor);
+    FillRect(hdc, &rc, hBr);
+    DeleteObject(hBr);
+
+    if (focused) {
+        RECT rf = rc;
+        InflateRect(&rf, -3, -3);
+        DrawFocusRect(hdc, &rf);
+    }
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, fgColor);
+    HFONT hOldFont = g_hDlgFont ? (HFONT)SelectObject(hdc, g_hDlgFont) : nullptr;
+    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (hOldFont) SelectObject(hdc, hOldFont);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -894,10 +954,43 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SendMessageW(hXlsBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
             SendMessageW(hList,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
         }
+        // Convert buttons to owner-draw for modern flat style
+        for (HWND hBtn : { hCsvBtn, hXlsBtn }) {
+            LONG_PTR s = GetWindowLongPtrW(hBtn, GWL_STYLE);
+            SetWindowLongPtrW(hBtn, GWL_STYLE, (s & ~BS_TYPEMASK) | BS_OWNERDRAW);
+        }
+        // Modern ListView colours
+        ListView_SetBkColor(hList, kClrBg);
+        ListView_SetTextBkColor(hList, kClrBg);
+        ListView_SetTextColor(hList, kClrText);
         InitListColumns(hList);
         UpdateListView(hList, rw->items);
         rw->hList = hList;
         return 0;
+    }
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        // Toolbar strip
+        RECT rcBar = { rc.left, rc.top, rc.right, RES_TOOLBAR_H - 1 };
+        if (g_hBrushInput) FillRect(hdc, &rcBar, g_hBrushInput);
+        // Separator line
+        HPEN hPen = CreatePen(PS_SOLID, 1, kClrSep);
+        HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+        MoveToEx(hdc, rc.left, RES_TOOLBAR_H - 1, nullptr);
+        LineTo(hdc, rc.right, RES_TOOLBAR_H - 1);
+        SelectObject(hdc, hOld);
+        DeleteObject(hPen);
+        // Content area (ListView sits here, but fill bg for safety)
+        RECT rcContent = { rc.left, RES_TOOLBAR_H, rc.right, rc.bottom };
+        if (g_hBrushBg) FillRect(hdc, &rcContent, g_hBrushBg);
+        return TRUE;
+    }
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (dis->CtlType == ODT_BUTTON) { DrawModernButton(dis); return TRUE; }
+        break;
     }
     case WM_SIZE: {
         auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -999,6 +1092,24 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_uiThreadId = GetCurrentThreadId();
         g_hDlgFont = (HFONT)SendMessageW(GetDlgItem(hwnd, IDC_BTN_SEARCH), WM_GETFONT, 0, 0);
         g_hDebug = GetDlgItem(hwnd, IDC_DEBUG);
+
+        // Create theme brushes
+        g_hBrushBg    = CreateSolidBrush(kClrBg);
+        g_hBrushInput = CreateSolidBrush(kClrInput);
+        g_hBrushDebug = CreateSolidBrush(kClrDbBg);
+
+        // Convert all toolbar buttons to owner-draw (flat modern style)
+        static const int kDlgBtns[] = {
+            IDC_BTN_SEARCH_AREA_NAME, IDC_BTN_SEARCH, IDC_BTN_AREA,
+            IDC_BTN_CSV, IDC_BTN_XLS, IDC_BTN_TOGGLE_MODE
+        };
+        for (int id : kDlgBtns) {
+            HWND h = GetDlgItem(hwnd, id);
+            if (!h) continue;
+            LONG_PTR s = GetWindowLongPtrW(h, GWL_STYLE);
+            SetWindowLongPtrW(h, GWL_STYLE, (s & ~BS_TYPEMASK) | BS_OWNERDRAW);
+        }
+
         SetDlgItemTextW(hwnd, IDC_LAT, L"25.033000");
         SetDlgItemTextW(hwnd, IDC_LON, L"121.565400");
         SetDlgItemTextW(hwnd, IDC_RADIUS, L"1500");
@@ -1140,8 +1251,61 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         delete msg;
         return TRUE;
     }
+    case WM_ERASEBKGND: {
+        if (!g_hBrushBg) break;
+        HDC hdc = (HDC)wParam;
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_hBrushBg);
+        // Thin separator between toolbar and map/content area
+        if (g_layout.ready) {
+            int sepY = g_layout.contentTop - 3;
+            HPEN hPen = CreatePen(PS_SOLID, 1, kClrSep);
+            HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+            MoveToEx(hdc, 0, sepY, nullptr);
+            LineTo(hdc, rc.right, sepY);
+            SelectObject(hdc, hOld);
+            DeleteObject(hPen);
+        }
+        return TRUE;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        HWND hCtrl = (HWND)lParam;
+        if (GetDlgCtrlID(hCtrl) == IDC_DEBUG) {
+            SetTextColor(hdc, kClrDbFg);
+            SetBkColor(hdc, kClrDbBg);
+            return (INT_PTR)g_hBrushDebug;
+        }
+        SetTextColor(hdc, kClrText);
+        SetBkColor(hdc, kClrInput);
+        return (INT_PTR)g_hBrushInput;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, kClrLabel);
+        SetBkMode(hdc, TRANSPARENT);
+        SetBkColor(hdc, kClrBg);
+        return (INT_PTR)g_hBrushBg;
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, kClrText);
+        SetBkColor(hdc, kClrInput);
+        return (INT_PTR)g_hBrushInput;
+    }
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (dis->CtlType == ODT_BUTTON) { DrawModernButton(dis); return TRUE; }
+        break;
+    }
     case WM_CLOSE:
         EndDialog(hwnd, 0);
+        return TRUE;
+    case WM_DESTROY:
+        if (g_hBrushBg)    { DeleteObject(g_hBrushBg);    g_hBrushBg    = nullptr; }
+        if (g_hBrushInput) { DeleteObject(g_hBrushInput); g_hBrushInput = nullptr; }
+        if (g_hBrushDebug) { DeleteObject(g_hBrushDebug); g_hBrushDebug = nullptr; }
         return TRUE;
     }
     return FALSE;
