@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cwctype>
+#include <regex>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <xlsxwriter.h>
@@ -86,8 +87,9 @@ static HBRUSH g_hBrushDebug = nullptr;
 static ComPtr<ICoreWebView2Controller> g_webController;
 static ComPtr<ICoreWebView2> g_webView;
 
-static constexpr UINT WM_SEARCH_DONE = WM_APP + 1;
-static constexpr UINT WM_LOG_MSG     = WM_APP + 2;
+static constexpr UINT WM_SEARCH_DONE     = WM_APP + 1;
+static constexpr UINT WM_LOG_MSG         = WM_APP + 2;
+static constexpr UINT WM_SUPPLEMENT_DONE = WM_APP + 3;
 
 static std::string Trim(std::string s) {  // internal only
     auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
@@ -821,10 +823,17 @@ static void InitWebView(HWND hwnd) {
     }
 }
 
-static constexpr int IDC_RES_CSV  = 1;
-static constexpr int IDC_RES_XLS  = 2;
-static constexpr int IDC_RES_LIST = 3;
+static constexpr int IDC_RES_CSV   = 1;
+static constexpr int IDC_RES_XLS   = 2;
+static constexpr int IDC_RES_LIST  = 3;
+static constexpr int IDC_RES_PHONE = 4;
 static constexpr int RES_TOOLBAR_H = 34;
+
+struct SupplementContext {
+    HWND hwndResult;
+    std::vector<PlaceItem> items;
+    volatile bool cancelled = false;
+};
 
 struct ResultWindow {
     std::vector<PlaceItem> items;
@@ -891,6 +900,9 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         HWND hXlsBtn = CreateWindowExW(0, L"BUTTON", L"Export Excel",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             120, 4, 110, 26, hwnd, (HMENU)(UINT_PTR)IDC_RES_XLS, hInst, nullptr);
+        HWND hPhoneBtn = CreateWindowExW(0, L"BUTTON", L"Supplement Phone",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            236, 4, 130, 26, hwnd, (HMENU)(UINT_PTR)IDC_RES_PHONE, hInst, nullptr);
         RECT rc{};
         GetClientRect(hwnd, &rc);
         HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
@@ -898,9 +910,10 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             0, RES_TOOLBAR_H, rc.right, rc.bottom - RES_TOOLBAR_H,
             hwnd, (HMENU)(UINT_PTR)IDC_RES_LIST, hInst, nullptr);
         if (g_hDlgFont) {
-            SendMessageW(hCsvBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
-            SendMessageW(hXlsBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
-            SendMessageW(hList,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hCsvBtn,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hXlsBtn,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hPhoneBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hList,     WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
         }
         // Convert buttons to owner-draw for modern flat style
         for (HWND hBtn : { hCsvBtn, hXlsBtn }) {
@@ -914,6 +927,7 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         InitListColumns(hList);
         UpdateListView(hList, rw->items);
         rw->hList = hList;
+        rw->hPhoneBtn = hPhoneBtn;
         return 0;
     }
     case WM_ERASEBKGND: {
@@ -963,6 +977,47 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 MessageBoxW(hwnd, (L"Exported: " + name).c_str(), L"Export Excel", MB_OK);
             else
                 MessageBoxW(hwnd, L"Export failed", L"Export Excel", MB_OK | MB_ICONERROR);
+        } else if (LOWORD(wParam) == IDC_RES_PHONE) {
+            if (!rw->hPhoneBtn) break;
+            int missing = 0;
+            for (const auto& item : rw->items)
+                if (item.phone.empty() && !item.name.empty()) ++missing;
+            if (missing == 0) {
+                MessageBoxW(hwnd, L"All items already have phone numbers.", L"Supplement Phone", MB_OK);
+                break;
+            }
+            EnableWindow(rw->hPhoneBtn, FALSE);
+            LogMsg(L"Supplement Phone: searching " + std::to_wstring(missing) + L" items...");
+            // Free any leftover context from a previous (completed) run.
+            delete rw->supplementCtx;
+            auto* ctx = new SupplementContext{};
+            ctx->hwndResult = hwnd;
+            ctx->items = rw->items;
+            rw->supplementCtx = ctx;  // ResultWindow takes ownership
+            HANDLE hThread = CreateThread(nullptr, 0, SupplementThreadProc, ctx, 0, nullptr);
+            if (hThread) {
+                rw->hSupplementThread = hThread;  // keep handle for WM_DESTROY
+            } else {
+                delete rw->supplementCtx;
+                rw->supplementCtx = nullptr;
+                EnableWindow(rw->hPhoneBtn, TRUE);
+                LogMsg(L"failed to start supplement thread");
+            }
+        }
+        return 0;
+    }
+    case WM_SUPPLEMENT_DONE: {
+        auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        auto* ctx = reinterpret_cast<SupplementContext*>(lParam);
+        if (rw && ctx) {
+            rw->items = std::move(ctx->items);
+            UpdateListView(rw->hList, rw->items);
+            if (rw->hPhoneBtn) EnableWindow(rw->hPhoneBtn, TRUE);
+            // Close the thread handle; ctx is still owned by rw->supplementCtx.
+            if (rw->hSupplementThread) {
+                CloseHandle(rw->hSupplementThread);
+                rw->hSupplementThread = nullptr;
+            }
         }
         return 0;
     }
@@ -1012,6 +1067,18 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     }
     case WM_DESTROY: {
         auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (rw) {
+            if (rw->hSupplementThread) {
+                // Signal cancellation and wait for the thread to exit cleanly.
+                if (rw->supplementCtx) rw->supplementCtx->cancelled = true;
+                WaitForSingleObject(rw->hSupplementThread, INFINITE);
+                CloseHandle(rw->hSupplementThread);
+                rw->hSupplementThread = nullptr;
+            }
+            // ResultWindow owns supplementCtx; always safe to delete (may be null).
+            delete rw->supplementCtx;
+            rw->supplementCtx = nullptr;
+        }
         delete rw;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         return 0;
