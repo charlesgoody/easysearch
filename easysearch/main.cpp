@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cwctype>
+#include <regex>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <xlsxwriter.h>
@@ -86,8 +87,9 @@ static HBRUSH g_hBrushDebug = nullptr;
 static ComPtr<ICoreWebView2Controller> g_webController;
 static ComPtr<ICoreWebView2> g_webView;
 
-static constexpr UINT WM_SEARCH_DONE = WM_APP + 1;
-static constexpr UINT WM_LOG_MSG     = WM_APP + 2;
+static constexpr UINT WM_SEARCH_DONE     = WM_APP + 1;
+static constexpr UINT WM_LOG_MSG         = WM_APP + 2;
+static constexpr UINT WM_SUPPLEMENT_DONE = WM_APP + 3;
 
 static std::string Trim(std::string s) {  // internal only
     auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
@@ -821,60 +823,120 @@ static void InitWebView(HWND hwnd) {
     }
 }
 
-static constexpr int IDC_RES_CSV  = 1;
-static constexpr int IDC_RES_XLS  = 2;
-static constexpr int IDC_RES_LIST = 3;
+static constexpr int IDC_RES_CSV   = 1;
+static constexpr int IDC_RES_XLS   = 2;
+static constexpr int IDC_RES_LIST  = 3;
+static constexpr int IDC_RES_PHONE = 4;
 static constexpr int RES_TOOLBAR_H = 34;
+
+struct SupplementContext {
+    HWND hwndResult;
+    std::vector<PlaceItem> items;
+    volatile bool cancelled = false;
+};
 
 struct ResultWindow {
     std::vector<PlaceItem> items;
     int presetIndex = 0;
     SYSTEMTIME searchTime{};
-    HWND hList = nullptr;
-    HWND hWnd  = nullptr; // set in WM_CREATE, used by enrichment
+    HWND hList      = nullptr;
+    HWND hPhoneBtn  = nullptr;
+    SupplementContext* supplementCtx  = nullptr;  // owned by ResultWindow
+    HANDLE hSupplementThread          = nullptr;
 };
 
-// ── Modern button renderer (owner-draw) ──────────────────────────────────────
-// Buttons whose text contains "Search" get the accent (blue) style.
-static void DrawModernButton(const DRAWITEMSTRUCT* dis) {
-    HDC   hdc     = dis->hDC;
-    RECT  rc      = dis->rcItem;
-    bool  pressed  = (dis->itemState & ODS_SELECTED) != 0;
-    bool  disabled = (dis->itemState & ODS_DISABLED)  != 0;
-    bool  focused  = (dis->itemState & ODS_FOCUS)     != 0;
+// ── Phone supplement helpers ──────────────────────────────────────────────────
 
-    wchar_t text[128]{};
-    GetWindowTextW(dis->hwndItem, text, 128);
-    bool accent = (wcsstr(text, L"Search") != nullptr);
-
-    COLORREF bgColor, fgColor;
-    if (disabled) {
-        bgColor = RGB(0xCC, 0xCC, 0xCC);
-        fgColor = RGB(0x88, 0x88, 0x88);
-    } else if (accent) {
-        bgColor = pressed ? kClrAccentPr : kClrAccent;
-        fgColor = RGB(0xFF, 0xFF, 0xFF);
-    } else {
-        bgColor = pressed ? kClrNeutralPr : kClrNeutral;
-        fgColor = kClrText;
-    }
-
-    HBRUSH hBr = CreateSolidBrush(bgColor);
-    FillRect(hdc, &rc, hBr);
-    DeleteObject(hBr);
-
-    if (focused) {
-        RECT rf = rc;
-        InflateRect(&rf, -3, -3);
-        DrawFocusRect(hdc, &rf);
-    }
-
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, fgColor);
-    HFONT hOldFont = g_hDlgFont ? (HFONT)SelectObject(hdc, g_hDlgFont) : nullptr;
-    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    if (hOldFont) SelectObject(hdc, hOldFont);
+static std::string CurlEscapeStr(const std::string& s) {
+    CURL* c = curl_easy_init();
+    if (!c) return s;
+    char* enc = curl_easy_escape(c, s.c_str(), (int)s.size());
+    std::string result = enc ? std::string(enc) : s;
+    curl_free(enc);
+    curl_easy_cleanup(c);
+    return result;
 }
+
+static std::string HttpGetSimple(const std::string& url) {
+    CURL* c = curl_easy_init();
+    if (!c) return {};
+    std::string resp;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, CurlWriteCb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(c, CURLOPT_USERAGENT,
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36");
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_perform(c);
+    curl_easy_cleanup(c);
+    return resp;
+}
+
+// Extract first Taiwan phone number found in raw text/HTML.
+// Covers: +886 international, 0X/0XX landline, 09XX mobile.
+static std::string ExtractPhoneFromText(const std::string& text) {
+    static const std::regex re(
+        R"((?:\+886[\s\-]?(?:9\d{2}[\s\-]?\d{3}[\s\-]?\d{3}|[2-8]\d?[\s\-]?\d{3,4}[\s\-]?\d{4}))"
+        R"(|0(?:9\d{2}[\s\-]?\d{3}[\s\-]?\d{3}|[2-8]\d?[\s\-]?\d{3,4}[\s\-]?\d{4})))",
+        std::regex::optimize
+    );
+    std::smatch m;
+    if (std::regex_search(text, m, re)) return Trim(m[0].str());
+    return {};
+}
+
+static DWORD WINAPI SupplementThreadProc(LPVOID lpParam) {
+    auto* ctx = static_cast<SupplementContext*>(lpParam);
+    int total = (int)ctx->items.size();
+    int updated = 0;
+
+    for (int i = 0; i < total; ++i) {
+        if (ctx->cancelled) break;
+
+        auto& item = ctx->items[i];
+        if (!item.phone.empty() || item.name.empty()) continue;
+
+        // Primary: Chinese search (Taiwan)
+        std::string url1 = "https://html.duckduckgo.com/html/?q="
+            + CurlEscapeStr(item.name + " 電話") + "&kl=tw-tzh";
+        std::string html = HttpGetSimple(url1);
+        std::string phone = ExtractPhoneFromText(html);
+
+        if (phone.empty() && !ctx->cancelled) {
+            // Fallback: English search (international)
+            std::string url2 = "https://html.duckduckgo.com/html/?q="
+                + CurlEscapeStr(item.name + " phone");
+            html = HttpGetSimple(url2);
+            phone = ExtractPhoneFromText(html);
+        }
+
+        if (!phone.empty()) {
+            item.phone = phone;
+            ++updated;
+            LogMsg(L"[Supp " + std::to_wstring(i + 1) + L"/" + std::to_wstring(total)
+                   + L"] " + U2W(item.name) + L" \u2192 " + U2W(phone));
+        } else {
+            LogMsg(L"[Supp " + std::to_wstring(i + 1) + L"/" + std::to_wstring(total)
+                   + L"] " + U2W(item.name) + L" \u2192 not found");
+        }
+
+        Sleep(800); // rate-limit: avoid DuckDuckGo block
+    }
+
+    // Only post back if not cancelled; WM_DESTROY handles cleanup when cancelled.
+    if (!ctx->cancelled) {
+        LogMsg(L"Supplement done: " + std::to_wstring(updated) + L"/" + std::to_wstring(total)
+               + L" phones updated.");
+        PostMessageW(ctx->hwndResult, WM_SUPPLEMENT_DONE, 0, (LPARAM)ctx);
+    }
+    return 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -891,6 +953,9 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         HWND hXlsBtn = CreateWindowExW(0, L"BUTTON", L"Export Excel",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             120, 4, 110, 26, hwnd, (HMENU)(UINT_PTR)IDC_RES_XLS, hInst, nullptr);
+        HWND hPhoneBtn = CreateWindowExW(0, L"BUTTON", L"Supplement Phone",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            236, 4, 130, 26, hwnd, (HMENU)(UINT_PTR)IDC_RES_PHONE, hInst, nullptr);
         RECT rc{};
         GetClientRect(hwnd, &rc);
         HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
@@ -898,9 +963,10 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             0, RES_TOOLBAR_H, rc.right, rc.bottom - RES_TOOLBAR_H,
             hwnd, (HMENU)(UINT_PTR)IDC_RES_LIST, hInst, nullptr);
         if (g_hDlgFont) {
-            SendMessageW(hCsvBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
-            SendMessageW(hXlsBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
-            SendMessageW(hList,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hCsvBtn,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hXlsBtn,   WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hPhoneBtn, WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
+            SendMessageW(hList,     WM_SETFONT, (WPARAM)g_hDlgFont, FALSE);
         }
         // Convert buttons to owner-draw for modern flat style
         for (HWND hBtn : { hCsvBtn, hXlsBtn }) {
@@ -914,6 +980,7 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         InitListColumns(hList);
         UpdateListView(hList, rw->items);
         rw->hList = hList;
+        rw->hPhoneBtn = hPhoneBtn;
         return 0;
     }
     case WM_ERASEBKGND: {
@@ -963,6 +1030,47 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 MessageBoxW(hwnd, (L"Exported: " + name).c_str(), L"Export Excel", MB_OK);
             else
                 MessageBoxW(hwnd, L"Export failed", L"Export Excel", MB_OK | MB_ICONERROR);
+        } else if (LOWORD(wParam) == IDC_RES_PHONE) {
+            if (!rw->hPhoneBtn) break;
+            int missing = 0;
+            for (const auto& item : rw->items)
+                if (item.phone.empty() && !item.name.empty()) ++missing;
+            if (missing == 0) {
+                MessageBoxW(hwnd, L"All items already have phone numbers.", L"Supplement Phone", MB_OK);
+                break;
+            }
+            EnableWindow(rw->hPhoneBtn, FALSE);
+            LogMsg(L"Supplement Phone: searching " + std::to_wstring(missing) + L" items...");
+            // Free any leftover context from a previous (completed) run.
+            delete rw->supplementCtx;
+            auto* ctx = new SupplementContext{};
+            ctx->hwndResult = hwnd;
+            ctx->items = rw->items;
+            rw->supplementCtx = ctx;  // ResultWindow takes ownership
+            HANDLE hThread = CreateThread(nullptr, 0, SupplementThreadProc, ctx, 0, nullptr);
+            if (hThread) {
+                rw->hSupplementThread = hThread;  // keep handle for WM_DESTROY
+            } else {
+                delete rw->supplementCtx;
+                rw->supplementCtx = nullptr;
+                EnableWindow(rw->hPhoneBtn, TRUE);
+                LogMsg(L"failed to start supplement thread");
+            }
+        }
+        return 0;
+    }
+    case WM_SUPPLEMENT_DONE: {
+        auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        auto* ctx = reinterpret_cast<SupplementContext*>(lParam);
+        if (rw && ctx) {
+            rw->items = std::move(ctx->items);
+            UpdateListView(rw->hList, rw->items);
+            if (rw->hPhoneBtn) EnableWindow(rw->hPhoneBtn, TRUE);
+            // Close the thread handle; ctx is still owned by rw->supplementCtx.
+            if (rw->hSupplementThread) {
+                CloseHandle(rw->hSupplementThread);
+                rw->hSupplementThread = nullptr;
+            }
         }
         return 0;
     }
@@ -1012,6 +1120,18 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     }
     case WM_DESTROY: {
         auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (rw) {
+            if (rw->hSupplementThread) {
+                // Signal cancellation and wait for the thread to exit cleanly.
+                if (rw->supplementCtx) rw->supplementCtx->cancelled = true;
+                WaitForSingleObject(rw->hSupplementThread, INFINITE);
+                CloseHandle(rw->hSupplementThread);
+                rw->hSupplementThread = nullptr;
+            }
+            // ResultWindow owns supplementCtx; always safe to delete (may be null).
+            delete rw->supplementCtx;
+            rw->supplementCtx = nullptr;
+        }
         delete rw;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         return 0;
