@@ -15,6 +15,10 @@
 #include <WebView2.h>
 #include "resource.h"
 #include "place_types.h"
+#include "search_common.h"
+#include "search_latlon.h"
+#include "search_area.h"
+#include "here_api.h"
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Ws2_32.lib")
@@ -23,20 +27,6 @@
 
 using json = nlohmann::json;
 using Microsoft::WRL::ComPtr;
-
-struct PlaceItem {
-    std::string name;
-    std::string category;
-    std::string brand;
-    std::string cuisine;
-    std::string address;
-    std::string phone;
-    std::string website;
-    std::string openingHours;
-    std::string email;
-    double lat = 0.0;
-    double lon = 0.0;
-};
 
 static const char* kOverpassEndpoints[] = {
     "https://overpass-api.de/api/interpreter",
@@ -99,14 +89,14 @@ static ComPtr<ICoreWebView2> g_webView;
 static constexpr UINT WM_SEARCH_DONE = WM_APP + 1;
 static constexpr UINT WM_LOG_MSG     = WM_APP + 2;
 
-static std::string Trim(std::string s) {
+static std::string Trim(std::string s) {  // internal only
     auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
     s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
     return s;
 }
 
-static std::string W2U(const std::wstring& s) {
+std::string W2U(const std::wstring& s) {
     if (s.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (n <= 0) return {};
@@ -115,7 +105,7 @@ static std::string W2U(const std::wstring& s) {
     return std::string(buf.data());
 }
 
-static std::wstring U2W(const std::string& s) {
+std::wstring U2W(const std::string& s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     if (n <= 0) return {};
@@ -136,7 +126,7 @@ static bool ContainsNoCase(const std::wstring& haystack, const std::wstring& nee
     return h.find(n) != std::wstring::npos;
 }
 
-static void LogMsg(const std::wstring& msg) {
+void LogMsg(const std::wstring& msg) {
     if (!g_hDlg) return;
     if (g_uiThreadId && GetCurrentThreadId() != g_uiThreadId) {
         PostMessageW(g_hDlg, WM_LOG_MSG, 0, (LPARAM) new std::wstring(msg));
@@ -368,7 +358,7 @@ static bool PerformOverpassPost(const std::string& endpoint, const std::string& 
     return rc == CURLE_OK;
 }
 
-static bool RunOverpassQuery(const std::string& query, const std::wstring& categoryLabel, std::vector<PlaceItem>& out) {
+bool RunOverpassQuery(const std::string& query, const std::wstring& categoryLabel, std::vector<PlaceItem>& out) {
     for (int endpointIndex = 0; endpointIndex < kOverpassEndpointCount; ++endpointIndex) {
         const std::string endpoint = kOverpassEndpoints[endpointIndex];
         for (int attempt = 0; attempt < 3; ++attempt) {
@@ -407,70 +397,8 @@ static bool RunOverpassQuery(const std::string& query, const std::wstring& categ
     return false;
 }
 
-static std::vector<int> BuildRadiusPlan(double radius) {
-    int start = (radius > 0.0) ? (int)(radius + 0.5) : 1500;
-    std::vector<int> plan;
-    auto addUnique = [&](int r) {
-        if (r <= 0) return;
-        if (std::find(plan.begin(), plan.end(), r) == plan.end()) plan.push_back(r);
-        };
-    addUnique(start);
-    if (start > 800) addUnique(800);
-    if (start > 400) addUnique(400);
-    if (start > 200) addUnique(200);
-    return plan;
-}
-
-static bool SearchByRadius(double lat, double lon, double radius, int presetIndex, std::vector<PlaceItem>& out) {
-    const auto& preset = kPlaceTypes[presetIndex];
-    auto plan = BuildRadiusPlan(radius);
-    for (int r : plan) {
-        LogMsg(L"radius try = " + std::to_wstring(r));
-        std::ostringstream q;
-        q << "[out:json][timeout:20];(";
-        q << "node(around:" << r << "," << lat << "," << lon << ")[\"" << preset.key << "\"=\"" << preset.value << "\"];";
-        q << "way(around:" << r << "," << lat << "," << lon << ")[\"" << preset.key << "\"=\"" << preset.value << "\"];";
-        q << "relation(around:" << r << "," << lat << "," << lon << ")[\"" << preset.key << "\"=\"" << preset.value << "\"];";
-        q << ");out center tags;";
-        if (RunOverpassQuery(q.str(), preset.label, out)) return true;
-    }
-    return false;
-}
-
-static bool SearchByBBox(double south, double west, double north, double east, int presetIndex, std::vector<PlaceItem>& out) {
-    const auto& preset = kPlaceTypes[presetIndex];
-    std::ostringstream q;
-    q << "[out:json][timeout:20];(";
-    q << "node[\"" << preset.key << "\"=\"" << preset.value << "\"](" << south << "," << west << "," << north << "," << east << ");";
-    q << "way[\"" << preset.key << "\"=\"" << preset.value << "\"](" << south << "," << west << "," << north << "," << east << ");";
-    q << "relation[\"" << preset.key << "\"=\"" << preset.value << "\"](" << south << "," << west << "," << north << "," << east << ");";
-    q << ");out center tags;";
-    return RunOverpassQuery(q.str(), preset.label, out);
-}
-
-// Search by administrative area name (e.g. "台北市", "大安區", "Taipei City").
-// Tries name → name:zh → name:en in sequence to handle both Chinese and English input.
-static bool SearchByAreaName(const std::string& areaName, int presetIndex, std::vector<PlaceItem>& out) {
-    const auto& preset = kPlaceTypes[presetIndex];
-    static const char* kNameTags[] = { "name", "name:zh", "name:en" };
-
-    for (const char* tag : kNameTags) {
-        std::ostringstream q;
-        q << "[out:json][timeout:30];";
-        q << "area[\"" << tag << "\"=\"" << areaName << "\"]->.a;";
-        q << "(";
-        q << "node[\"" << preset.key << "\"=\"" << preset.value << "\"](area.a);";
-        q << "way[\"" << preset.key << "\"=\"" << preset.value << "\"](area.a);";
-        q << "relation[\"" << preset.key << "\"=\"" << preset.value << "\"](area.a);";
-        q << ");out center tags;";
-
-        LogMsg(L"Area search: [" + U2W(tag) + L"=\"" + U2W(areaName) + L"\"]");
-        bool ok = RunOverpassQuery(q.str(), preset.label, out);
-        if (ok && !out.empty()) return true;
-        if (ok && out.empty()) LogMsg(L"No results, trying next name tag...");
-    }
-    return false;
-}
+// BuildRadiusPlan / SearchByRadius / SearchByBBox → search_latlon.cpp
+// SearchByAreaName                                → search_area.cpp
 
 struct SearchContext {
     HWND hwnd;
@@ -730,16 +658,33 @@ static void SetSearchMode(HWND hwnd, bool areaMode) {
                    areaMode ? L"[ Lat/Lon ]" : L"[ Area ]");
 }
 
+// Load an RCDATA resource as a std::string (no NUL terminator added by Windows).
+static std::string LoadRCString(int id) {
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!hRes) return {};
+    HGLOBAL hData = LoadResource(hInst, hRes);
+    if (!hData) return {};
+    DWORD sz = SizeofResource(hInst, hRes);
+    const char* ptr = static_cast<const char*>(LockResource(hData));
+    return std::string(ptr, sz);
+}
+
 static std::wstring GetMapHtml() {
-    return LR"HTML(
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>
+    // Leaflet CSS and JS are embedded as RCDATA – no CDN request needed.
+    std::string css = LoadRCString(IDR_LEAFLET_CSS);
+    std::string js  = LoadRCString(IDR_LEAFLET_JS);
+
+    std::string html;
+    html.reserve(css.size() + js.size() + 2048);
+    html += "<!doctype html><html><head>"
+            "<meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\">"
+            "<style>";
+    html += css;
+    html += "</style><script>";
+    html += js;
+    html += R"MAPJS(</script><style>
 html, body, #map { height:100%; width:100%; margin:0; padding:0; overflow:hidden; }
 #crosshair { position:absolute; left:50%; top:50%; width:18px; height:18px; margin-left:-9px; margin-top:-9px; pointer-events:none; z-index:1000; }
 #crosshair:before, #crosshair:after { content:''; position:absolute; background:#d00; }
@@ -783,7 +728,8 @@ window.setCenterFromHost = function(lat, lon, zoom) {
 postState();
 </script>
 </body>
-</html>)HTML";
+</html>)MAPJS";
+    return U2W(html);
 }
 
 static void ResizeWebView() {
@@ -885,6 +831,7 @@ struct ResultWindow {
     int presetIndex = 0;
     SYSTEMTIME searchTime{};
     HWND hList = nullptr;
+    HWND hWnd  = nullptr; // set in WM_CREATE, used by enrichment
 };
 
 // ── Modern button renderer (owner-draw) ──────────────────────────────────────
@@ -936,6 +883,7 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
         auto* rw = static_cast<ResultWindow*>(cs->lpCreateParams);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)rw);
+        rw->hWnd = hwnd;
         HINSTANCE hInst = cs->hInstance;
         HWND hCsvBtn = CreateWindowExW(0, L"BUTTON", L"Export CSV",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -1018,6 +966,50 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         }
         return 0;
     }
+    case WM_ITEM_ENRICHED: {
+        // wParam = item index, lParam = heap PlaceItem* owned by this handler
+        int idx = (int)wParam;
+        auto* enriched = reinterpret_cast<PlaceItem*>(lParam);
+        auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (rw && enriched && idx >= 0 && idx < (int)rw->items.size()) {
+            // Merge: only overwrite fields that are empty in the original
+            PlaceItem& orig = rw->items[idx];
+            if (orig.phone.empty() && !enriched->phone.empty())
+                orig.phone = enriched->phone;
+            if (orig.website.empty() && !enriched->website.empty())
+                orig.website = enriched->website;
+            if (orig.openingHours.empty() && !enriched->openingHours.empty())
+                orig.openingHours = enriched->openingHours;
+            // Refresh this single ListView row
+            if (rw->hList) {
+                auto toW = [](const std::string& s) -> std::wstring { return U2W(s); };
+                LVITEMW lvi{};
+                lvi.mask = LVIF_TEXT;
+                lvi.iItem = idx;
+                auto setText = [&](int col, const std::wstring& txt) {
+                    lvi.iSubItem = col;
+                    lvi.pszText  = const_cast<wchar_t*>(txt.c_str());
+                    ListView_SetItem(rw->hList, &lvi);
+                };
+                setText(0,  toW(orig.name));
+                setText(1,  toW(orig.category));
+                setText(2,  toW(orig.brand));
+                setText(3,  toW(orig.cuisine));
+                setText(4,  toW(orig.address));
+                setText(5,  toW(orig.phone));
+                setText(6,  toW(orig.website));
+                setText(7,  toW(orig.openingHours));
+                setText(8,  toW(orig.email));
+                wchar_t latBuf[32]{}, lonBuf[32]{};
+                swprintf_s(latBuf, L"%.6f", orig.lat);
+                swprintf_s(lonBuf, L"%.6f", orig.lon);
+                setText(9,  latBuf);
+                setText(10, lonBuf);
+            }
+        }
+        delete enriched;
+        return 0;
+    }
     case WM_DESTROY: {
         auto* rw = reinterpret_cast<ResultWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         delete rw;
@@ -1028,7 +1020,7 @@ static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static void CreateResultWindow(HWND hOwner, SearchContext* ctx) {
+static HWND CreateResultWindow(HWND hOwner, SearchContext* ctx) {
     const SYSTEMTIME& st = ctx->startTime;
     int hour12 = st.wHour % 12;
     if (hour12 == 0) hour12 = 12;
@@ -1057,6 +1049,7 @@ static void CreateResultWindow(HWND hOwner, SearchContext* ctx) {
     );
     if (hwnd) ShowWindow(hwnd, SW_SHOW);
     else delete rw;
+    return hwnd;
 }
 
 INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1101,7 +1094,7 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Convert all toolbar buttons to owner-draw (flat modern style)
         static const int kDlgBtns[] = {
             IDC_BTN_SEARCH_AREA_NAME, IDC_BTN_SEARCH, IDC_BTN_AREA,
-            IDC_BTN_CSV, IDC_BTN_XLS, IDC_BTN_TOGGLE_MODE
+            IDC_BTN_TOGGLE_MODE, IDC_BTN_SETTINGS
         };
         for (int id : kDlgBtns) {
             HWND h = GetDlgItem(hwnd, id);
@@ -1114,8 +1107,6 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetDlgItemTextW(hwnd, IDC_LON, L"121.565400");
         SetDlgItemTextW(hwnd, IDC_RADIUS, L"1500");
         InitTypeCombo(hwnd);
-        EnableWindow(GetDlgItem(hwnd, IDC_BTN_CSV), FALSE);
-        EnableWindow(GetDlgItem(hwnd, IDC_BTN_XLS), FALSE);
         InitWebView(hwnd);
         CaptureLayout(hwnd);
         SetSearchMode(hwnd, true);  // start in area-name mode (primary)
@@ -1189,20 +1180,9 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return TRUE;
         }
-        case IDC_BTN_CSV: {
-            SYSTEMTIME st{}; GetLocalTime(&st);
-            std::wstring csvName = MakeExportFilename(g_lastPresetIndex, st, L".csv");
-            if (ExportCSVUtf8Bom(csvName, g_items)) LogMsg(L"CSV exported: " + csvName);
-            else LogMsg(L"CSV export failed");
+        case IDC_BTN_SETTINGS:
+            ShowSettingsDialog(hwnd);
             return TRUE;
-        }
-        case IDC_BTN_XLS: {
-            SYSTEMTIME st{}; GetLocalTime(&st);
-            std::wstring xlsName = MakeExportFilename(g_lastPresetIndex, st, L".xlsx");
-            if (ExportXLSX(xlsName, g_items)) LogMsg(L"Excel exported: " + xlsName);
-            else LogMsg(L"Excel export failed");
-            return TRUE;
-        }
         case IDC_BTN_SEARCH_AREA_NAME: {
             int presetIndex = GetSelectedPresetIndex(hwnd);
             if (presetIndex < 0) { LogMsg(L"Please select a place type first."); return TRUE; }
@@ -1234,7 +1214,22 @@ INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ? (L"area \"" + U2W(ctx->areaName) + L"\"")
                 : (ctx->byBBox ? L"bbox" : L"center");
             LogMsg(modeLabel + L" search count = " + std::to_wstring(ctx->result.size()));
-            CreateResultWindow(hwnd, ctx);
+            HWND hResult = CreateResultWindow(hwnd, ctx);
+
+            // Phase 2: HERE enrichment in background (no-op if key not set)
+            std::wstring wKey = GetHereApiKey();
+            if (!wKey.empty() && hResult && !ctx->result.empty()) {
+                LogMsg(L"[HERE] starting enrichment for "
+                       + std::to_wstring(ctx->result.size()) + L" items...");
+                // Note: ctx->result was moved into ResultWindow by CreateResultWindow;
+                // we pass items via the ResultWindow's items vector.
+                // Retrieve them from GWLP_USERDATA of hResult.
+                auto* rw = reinterpret_cast<ResultWindow*>(
+                    GetWindowLongPtrW(hResult, GWLP_USERDATA));
+                if (rw) {
+                    LaunchHereEnrichment(hResult, rw->items, W2U(wKey));
+                }
+            }
         } else {
             LogMsg(L"search failed");
         }

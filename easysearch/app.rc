@@ -3,6 +3,10 @@
 
 
 IDI_APPICON ICON "title.ico"
+
+// Leaflet 1.9.4 embedded as binary resources (avoids CDN dependency)
+IDR_LEAFLET_CSS RCDATA "leaflet.min.css"
+IDR_LEAFLET_JS  RCDATA "leaflet.min.js"
 IDD_MAINDIALOG DIALOGEX 0, 0, 1180, 700
 STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME
 CAPTION "Easysearch - Nearby Search"
@@ -26,9 +30,8 @@ BEGIN
         // ── Always-visible controls ──────────────────────────────────────────
         LTEXT           "Preset:",          IDC_STATIC,             338,  12,  26,   8
         COMBOBOX                            IDC_TYPE_COMBO,         368,  10, 160, 300, CBS_DROPDOWN | WS_VSCROLL | WS_TABSTOP
-        PUSHBUTTON      "Export CSV",       IDC_BTN_CSV,            684,  10,  60,  14
-        PUSHBUTTON      "Export Excel",     IDC_BTN_XLS,            750,  10,  70,  14
-        PUSHBUTTON      "[ Lat/Lon ]",      IDC_BTN_TOGGLE_MODE,    826,  10,  70,  14
+        PUSHBUTTON      "[ Lat/Lon ]",      IDC_BTN_TOGGLE_MODE,    684,  10,  70,  14
+        PUSHBUTTON      "Settings",         IDC_BTN_SETTINGS,       760,  10,  60,  14
 
         CONTROL         "", IDC_MAPHOST, "STATIC", WS_BORDER | WS_VISIBLE | WS_CHILD, 10, 34, 760, 646
         EDITTEXT        IDC_DEBUG, 780, 34, 390, 646, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY | WS_BORDER

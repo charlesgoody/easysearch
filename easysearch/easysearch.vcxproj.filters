@@ -21,6 +21,18 @@
     <ClInclude Include="place_types.h">
       <Filter>標頭檔</Filter>
     </ClInclude>
+    <ClInclude Include="search_common.h">
+      <Filter>標頭檔</Filter>
+    </ClInclude>
+    <ClInclude Include="search_latlon.h">
+      <Filter>標頭檔</Filter>
+    </ClInclude>
+    <ClInclude Include="search_area.h">
+      <Filter>標頭檔</Filter>
+    </ClInclude>
+    <ClInclude Include="here_api.h">
+      <Filter>標頭檔</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="app.rc">
@@ -31,6 +43,15 @@
     <ClCompile Include="main.cpp">
       <Filter>來源檔案</Filter>
     </ClCompile>
+    <ClCompile Include="search_latlon.cpp">
+      <Filter>來源檔案</Filter>
+    </ClCompile>
+    <ClCompile Include="search_area.cpp">
+      <Filter>來源檔案</Filter>
+    </ClCompile>
+    <ClCompile Include="here_api.cpp">
+      <Filter>來源檔案</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Image Include="title.ico">
@@ -38,6 +59,12 @@
     </Image>
   </ItemGroup>
   <ItemGroup>
+    <None Include="leaflet.min.css">
+      <Filter>資源檔</Filter>
+    </None>
+    <None Include="leaflet.min.js">
+      <Filter>資源檔</Filter>
+    </None>
     <None Include="..\README.md" />
     <None Include="..\README.zh-TW.md" />
   </ItemGroup>

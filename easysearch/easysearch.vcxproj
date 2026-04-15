@@ -21,15 +21,26 @@
   <ItemGroup>
     <ClInclude Include="place_types.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="search_common.h" />
+    <ClInclude Include="search_latlon.h" />
+    <ClInclude Include="search_area.h" />
+    <ClInclude Include="here_api.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="app.rc" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="search_latlon.cpp" />
+    <ClCompile Include="search_area.cpp" />
+    <ClCompile Include="here_api.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="title.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="leaflet.min.css" />
+    <None Include="leaflet.min.js" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\README.md">
