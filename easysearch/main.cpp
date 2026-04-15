@@ -839,6 +839,7 @@ struct ResultWindow {
     std::vector<PlaceItem> items;
     int presetIndex = 0;
     SYSTEMTIME searchTime{};
+    HWND hWnd       = nullptr;
     HWND hList      = nullptr;
     HWND hPhoneBtn  = nullptr;
     SupplementContext* supplementCtx  = nullptr;  // owned by ResultWindow
@@ -938,6 +939,34 @@ static DWORD WINAPI SupplementThreadProc(LPVOID lpParam) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Owner-draw helper: renders a flat modern button for BS_OWNERDRAW controls.
+static void DrawModernButton(const DRAWITEMSTRUCT* dis) {
+    const bool pressed  = (dis->itemState & ODS_SELECTED) != 0;
+    const bool focused  = (dis->itemState & ODS_FOCUS)    != 0;
+    const bool disabled = (dis->itemState & ODS_DISABLED)  != 0;
+
+    COLORREF clrBg   = disabled ? kClrNeutral
+                     : pressed  ? kClrAccentPr
+                                : kClrAccent;
+    COLORREF clrText = disabled ? kClrLabel : RGB(0xFF, 0xFF, 0xFF);
+
+    // Fill background
+    HBRUSH hBr = CreateSolidBrush(clrBg);
+    FillRect(dis->hDC, &dis->rcItem, hBr);
+    DeleteObject(hBr);
+
+    // Focus rectangle
+    if (focused) DrawFocusRect(dis->hDC, &dis->rcItem);
+
+    // Draw label
+    wchar_t text[128] = {};
+    GetWindowTextW(dis->hwndItem, text, 128);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, clrText);
+    DrawTextW(dis->hDC, text, -1, const_cast<RECT*>(&dis->rcItem),
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
 
 static LRESULT CALLBACK ResultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
